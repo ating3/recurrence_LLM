@@ -1,24 +1,19 @@
 """
-Build one-cancer CPTAC multi-omics recurrence tables.
+Build CPTAC multi-omics recurrence tables. Queries only; harmonization and
+filtering belong to whatever consumes these tables.
 
 Examples:
     python preprocessing_patients.py --study ucec -o processed/
-    python preprocessing_patients.py --study coad --recurrence-column recurrence -o processed/
+    python preprocessing_patients.py --study all -o processed/ --cache-dir .cache/
     python preprocessing_patients.py --study brca -o processed/ --save-modalities
-    python preprocessing_patients.py --study pdac -o processed/ --include-normal
-
-Repo usage:
-    python src/data_processing/proteomics.py --study ucec -o processed/
-    # writes to processed/Recurrence/UCEC/
 
 Inside Python:
-    output = process_cancer("ucec")
-    combined = output["combined"]
-    proteomics_only = output["proteomics"]
-    phospho_only = output["phosphoproteomics"]
+    combined = process_cancer("ucec")["combined"]
+    by_study = process_studies()["by_study"]   # {name: MultiOmicsOutput}
 """
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -422,6 +417,48 @@ def process_cancer(
     )
 
 
+def process_studies(
+    study_names: list[str] | None = None,
+    recurrence_column: str | None = None,
+    include_normal: bool = False,
+    cache_dir: Path | None = None,
+    skip_failures: bool = True,
+) -> dict:
+    """
+    Pull several studies. Returns {'by_study': {name: MultiOmicsOutput}, 'failed': {}}.
+    Tables are per-study and unreconciled; feature names are not comparable across studies.
+    """
+    study_names = [s.lower() for s in (study_names or ALL_STUDIES)]
+    if unknown := [s for s in study_names if s not in ALL_STUDIES]:
+        raise ValueError(f"Unknown studies {unknown}. Must be from: {ALL_STUDIES}")
+
+    if cache_dir:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    tag = "with_normal" if include_normal else "tumor_only"
+
+    by_study, failed = {}, {}
+    for name in study_names:
+        cached = cache_dir / f"{name}_{tag}.pkl" if cache_dir else None
+        try:
+            if cached and cached.exists():
+                by_study[name] = pd.read_pickle(cached)
+                continue
+            print(f"[{name}] downloading", file=sys.stderr)
+            by_study[name] = process_cancer(name, recurrence_column, include_normal)
+            if cached:
+                pd.to_pickle(by_study[name], cached)
+        except Exception as exc:  # one bad study should not kill the run
+            failed[name] = f"{type(exc).__name__}: {exc}"
+            print(f"[{name}] FAILED: {exc}", file=sys.stderr)
+            if not skip_failures:
+                raise
+
+    if not by_study:
+        raise RuntimeError(f"No studies processed. Failures: {failed}")
+    return {"by_study": by_study, "failed": failed}
+
+
 def _save_output(
     output: MultiOmicsOutput,
     output_dir: Path,
@@ -447,14 +484,17 @@ def _save_output(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process one CPTAC cancer into a proteomics + phosphoproteomics recurrence table."
+        description=(
+            "Query one or more CPTAC cancers into proteomics + phosphoproteomics "
+            "recurrence tables."
+        )
     )
     parser.add_argument(
         "-s",
         "--study",
-        choices=ALL_STUDIES,
+        nargs="+",
         required=True,
-        help="Single CPTAC study to process.",
+        help="One or more CPTAC studies, or 'all'.",
     )
     parser.add_argument(
         "-o",
@@ -481,24 +521,51 @@ def main():
             "because recurrence is a patient-level outcome label."
         ),
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for caching per-study output so reruns skip the download.",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Raise on the first study that fails instead of skipping it.",
+    )
 
     args = parser.parse_args()
-    output = process_cancer(
-        study_name=args.study,
+    studies = ALL_STUDIES if "all" in [s.lower() for s in args.study] else args.study
+
+    if len(studies) == 1:
+        output = process_cancer(
+            study_name=studies[0],
+            recurrence_column=args.recurrence_column,
+            include_normal=args.include_normal,
+        )
+        combined_path = _save_output(
+            output=output,
+            output_dir=args.output_dir,
+            study_name=studies[0],
+            save_modalities=args.save_modalities,
+        )
+        print(f"Saved combined data to {combined_path}")
+        print(f"Combined data shape: {output['combined'].shape}")
+        print(f"Proteomics-only shape: {output['proteomics'].shape}")
+        print(f"Phosphoproteomics-only shape: {output['phosphoproteomics'].shape}")
+        return
+
+    result = process_studies(
+        study_names=studies,
         recurrence_column=args.recurrence_column,
         include_normal=args.include_normal,
+        cache_dir=args.cache_dir,
+        skip_failures=not args.fail_fast,
     )
-    combined_path = _save_output(
-        output=output,
-        output_dir=args.output_dir,
-        study_name=args.study,
-        save_modalities=args.save_modalities,
-    )
-
-    print(f"Saved combined data to {combined_path}")
-    print(f"Combined data shape: {output['combined'].shape}")
-    print(f"Proteomics-only shape: {output['proteomics'].shape}")
-    print(f"Phosphoproteomics-only shape: {output['phosphoproteomics'].shape}")
+    for name, output in result["by_study"].items():
+        path = _save_output(output, args.output_dir, name, args.save_modalities)
+        print(f"[{name}] {output['combined'].shape} -> {path}")
+    if result["failed"]:
+        print(f"Failed: {list(result['failed'])}")
 
 
 if __name__ == "__main__":
