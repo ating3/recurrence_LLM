@@ -27,15 +27,35 @@ ALL_STUDIES = [
     "hnscc", "lscc", "coad",
 ]
 
-MODALITIES = ("proteomics", "phosphoproteomics")
+MODALITIES = ("proteomics", "phosphoproteomics", "acetylproteomics")
 
 RECURRENCE_STATUS_COLUMN = "Recurrence status (1, yes; 0, no)"
+DERIVED_RECURRENCE_TIME_COL = "Derived recurrence-free survival time, days"
+
+RECURRENCE_TIME_COLS = [
+    "Recurrence-free survival from collection, days",
+    "Recurrence-free survival, days",
+]
+
+CENSOR_TIME_COLS = [
+    "number_of_days_from_date_of_collection_to_date_of_last_contact",
+    "Overall survival from collection, days",
+    "number_of_days_from_date_of_initial_pathologic_diagnosis_to_date_of_last_contact",
+    "Overall survival, days",
+]
 
 RECURRENCE_CLINICAL_COLS = [
     "diagnostic_evidence_of_recurrence_or_relapse",
     "Recurrence-free survival, days",
     "Recurrence-free survival from collection, days",
     RECURRENCE_STATUS_COLUMN,
+    "number_of_days_from_date_of_collection_to_date_of_last_contact",
+    "Overall survival from collection, days",
+    "number_of_days_from_date_of_initial_pathologic_diagnosis_to_date_of_last_contact",
+    "Overall survival, days",
+    "Survival status (1, dead; 0, alive)",
+    "vital_status_at_date_of_last_contact",
+    "tumor_status_at_date_of_last_contact_or_death",
 ]
 
 SOURCE_BY_CANCER = {
@@ -49,6 +69,7 @@ SOURCE_BY_CANCER = {
     ("hnscc", "phosphoproteomics"): "umich",
     ("lscc", "phosphoproteomics"): "umich",
     ("coad", "phosphoproteomics"): "bcm",
+    ("coad", "proteomics"): "bcm",
 }
 
 META_COLS = [
@@ -58,13 +79,23 @@ META_COLS = [
     "Tumor_Present",
     *RECURRENCE_CLINICAL_COLS,
     "Recurrence",
+    DERIVED_RECURRENCE_TIME_COL,
 ]
 
 
 def _as_list(value) -> list:
+    if isinstance(value, str):
+        return [value]
     if isinstance(value, (list, tuple, set, np.ndarray, pd.Index)):
         return list(value)
-    return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
+def _empty_modality_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=META_COLS)
 
 
 def _make_unique(names: list[str]) -> list[str]:
@@ -77,6 +108,15 @@ def _make_unique(names: list[str]) -> list[str]:
     return unique_names
 
 
+def _first_numeric_available(df: pd.DataFrame, cols: list[str]) -> pd.Series:
+    out = pd.Series(np.nan, index=df.index, dtype="float64")
+    for col in cols:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors="coerce")
+            out = out.fillna(vals)
+    return out
+
+
 @dataclass
 class MultiOmicsOutput:
     """Container for a combined table plus direct modality access."""
@@ -84,6 +124,7 @@ class MultiOmicsOutput:
     patient_info: pd.DataFrame
     proteomics: pd.DataFrame
     phosphoproteomics: pd.DataFrame
+    acetylproteomics: pd.DataFrame
     combined: pd.DataFrame
 
     def __getitem__(self, key: str) -> pd.DataFrame:
@@ -94,19 +135,23 @@ class MultiOmicsOutput:
             "prot": "proteomics",
             "phos": "phosphoproteomics",
             "phospho": "phosphoproteomics",
+            "acetyl": "acetylproteomics",
             "all": "combined",
         }
         key = aliases.get(key, key)
         if not hasattr(self, key):
-            valid = ["patient_info", "proteomics", "phosphoproteomics", "combined"]
+            valid = [
+                "patient_info",
+                "proteomics",
+                "phosphoproteomics",
+                "acetylproteomics",
+                "combined",
+            ]
             raise KeyError(f"Unknown output key {key!r}. Valid keys: {valid}")
         return getattr(self, key)
 
 
 def _get_study(study_name: str):
-    """
-    Given a study name, return the CPTAC study object.
-    """
     try:
         study_class = getattr(cptac, study_name.capitalize())
     except AttributeError as exc:
@@ -116,9 +161,6 @@ def _get_study(study_name: str):
 
 
 def _choose_source(study, data_type: str, study_name: str) -> str:
-    """
-    Pick the requested source when known; otherwise use the only available source.
-    """
     data_sources = study.list_data_sources()
     available = (
         data_sources
@@ -143,9 +185,6 @@ def _choose_source(study, data_type: str, study_name: str) -> str:
 
 
 def _get_clinical_data(study, study_name: str) -> pd.DataFrame:
-    """
-    Return the clinical table for a CPTAC study.
-    """
     source = _choose_source(study, "clinical", study_name)
     clinical = study.get_clinical(source=source)
     clinical.index = clinical.index.astype(str)
@@ -153,9 +192,6 @@ def _get_clinical_data(study, study_name: str) -> pd.DataFrame:
 
 
 def _collapse_duplicate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Merge duplicate feature columns by taking the first non-missing value per sample.
-    """
     if not df.columns.duplicated().any():
         return df
 
@@ -173,13 +209,6 @@ def _remove_non_patient_samples(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _flatten_columns(cols) -> list[str]:
-    """
-    Collapse a possibly MultiIndex column axis into unique single-level strings.
-
-    Proteomics columns are commonly (Name, Database_ID). Phosphoproteomics columns
-    may have more levels. Non-empty levels are joined with "|", preserving enough
-    information to recover the gene symbol with col.split("|")[0].
-    """
     flat = []
     for col in cols:
         if isinstance(col, tuple):
@@ -199,9 +228,6 @@ def _find_recurrence_column(
     clinical: pd.DataFrame,
     recurrence_column: str | None = None,
 ) -> str | None:
-    """
-    Find the clinical recurrence label column, or validate the user-provided one.
-    """
     if recurrence_column is not None:
         if recurrence_column not in clinical.columns:
             raise ValueError(
@@ -242,9 +268,6 @@ def _find_recurrence_column(
 
 
 def _normalize_recurrence_value(value):
-    """
-    Convert common recurrence labels to booleans while preserving unknown labels.
-    """
     if pd.isna(value):
         return pd.NA
 
@@ -268,15 +291,28 @@ def _normalize_recurrence_value(value):
     return value
 
 
+def _add_derived_recurrence_time(patient_info: pd.DataFrame) -> pd.DataFrame:
+    patient_info = patient_info.copy()
+
+    recurrence_time = _first_numeric_available(patient_info, RECURRENCE_TIME_COLS)
+    censor_time = _first_numeric_available(patient_info, CENSOR_TIME_COLS)
+
+    event = patient_info["Recurrence"].astype("boolean")
+    derived_time = pd.Series(np.nan, index=patient_info.index, dtype="float64")
+
+    derived_time.loc[event == True] = recurrence_time.loc[event == True]
+    derived_time.loc[event == False] = censor_time.loc[event == False]
+
+    patient_info[DERIVED_RECURRENCE_TIME_COL] = derived_time
+    return patient_info
+
+
 def _build_patient_info(
     sample_ids: pd.Index,
     study_name: str,
     clinical: pd.DataFrame,
     recurrence_col: str | None,
 ) -> pd.DataFrame:
-    """
-    Build the front metadata block shared by both modalities.
-    """
     sample_ids = pd.Index(sample_ids.astype(str), name="Patient_ID")
     base_ids = sample_ids.str.replace(r"\.N$", "", regex=True)
 
@@ -308,6 +344,7 @@ def _build_patient_info(
     else:
         patient_info["Recurrence"] = pd.NA
 
+    patient_info = _add_derived_recurrence_time(patient_info)
     return patient_info[META_COLS]
 
 
@@ -319,9 +356,6 @@ def clean_abundance_data(
     recurrence_col: str | None,
     include_normal: bool = False,
 ) -> pd.DataFrame:
-    """
-    Return one modality with metadata columns first and prefixed feature columns.
-    """
     cleaned = _collapse_duplicate_features(abundance.copy())
     cleaned.index = cleaned.index.astype(str)
     cleaned.index.name = "Patient_ID"
@@ -346,33 +380,51 @@ def clean_abundance_data(
     return modality_df
 
 
-def _get_abundance(study, study_name: str, modality: str) -> pd.DataFrame:
-    source = _choose_source(study, modality, study_name)
-    return getattr(study, f"get_{modality}")(source=source)
+def _get_abundance(study, study_name: str, modality: str) -> pd.DataFrame | None:
+    try:
+        source = _choose_source(study, modality, study_name)
+        return getattr(study, f"get_{modality}")(source=source)
+    except Exception as exc:
+        print(
+            f"[{study_name}] skipping missing/unavailable {modality}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def combine_modalities(
-    proteomics: pd.DataFrame,
-    phosphoproteomics: pd.DataFrame,
+    modality_frames: dict[str, pd.DataFrame],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Build patient_info and a wide proteomics + phosphoproteomics matrix.
-    """
-    patient_info = (
-        pd.concat([proteomics[META_COLS], phosphoproteomics[META_COLS]], ignore_index=True)
-        .drop_duplicates(subset=["Patient_ID"], keep="first")
-        .sort_values(["Base_Patient_ID", "Tumor_Present"], ascending=[True, False])
-        .reset_index(drop=True)
-    )
+    patient_blocks = [
+        df[META_COLS]
+        for df in modality_frames.values()
+        if not df.empty and set(META_COLS).issubset(df.columns)
+    ]
 
-    prot_features = proteomics.drop(columns=[col for col in META_COLS if col != "Patient_ID"])
-    phos_features = phosphoproteomics.drop(columns=[col for col in META_COLS if col != "Patient_ID"])
+    if patient_blocks:
+        patient_info = (
+            pd.concat(patient_blocks, ignore_index=True)
+            .drop_duplicates(subset=["Patient_ID"], keep="first")
+            .sort_values(["Base_Patient_ID", "Tumor_Present"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
+    else:
+        patient_info = pd.DataFrame(columns=META_COLS)
 
-    combined = (
-        patient_info
-        .merge(prot_features, on="Patient_ID", how="left")
-        .merge(phos_features, on="Patient_ID", how="left")
-    )
+    combined = patient_info.copy()
+
+    for modality, df in modality_frames.items():
+        if df.empty:
+            continue
+
+        feature_cols = [col for col in df.columns if col not in META_COLS]
+        if not feature_cols:
+            continue
+
+        features = df[["Patient_ID", *feature_cols]]
+        combined = combined.merge(features, on="Patient_ID", how="left")
+
     return patient_info, combined
 
 
@@ -381,9 +433,6 @@ def process_cancer(
     recurrence_column: str | None = None,
     include_normal: bool = False,
 ) -> MultiOmicsOutput:
-    """
-    Pull proteomics and phosphoproteomics for one cancer and return split + combined tables.
-    """
     study_name = study_name.lower()
     if study_name not in ALL_STUDIES:
         raise ValueError(f"Study must be one of: {ALL_STUDIES}")
@@ -395,6 +444,11 @@ def process_cancer(
     modality_frames = {}
     for modality in MODALITIES:
         abundance = _get_abundance(study, study_name, modality)
+
+        if abundance is None:
+            modality_frames[modality] = _empty_modality_df()
+            continue
+
         modality_frames[modality] = clean_abundance_data(
             abundance=abundance,
             modality=modality,
@@ -404,15 +458,13 @@ def process_cancer(
             include_normal=include_normal,
         )
 
-    patient_info, combined = combine_modalities(
-        modality_frames["proteomics"],
-        modality_frames["phosphoproteomics"],
-    )
+    patient_info, combined = combine_modalities(modality_frames)
 
     return MultiOmicsOutput(
         patient_info=patient_info,
         proteomics=modality_frames["proteomics"],
         phosphoproteomics=modality_frames["phosphoproteomics"],
+        acetylproteomics=modality_frames["acetylproteomics"],
         combined=combined,
     )
 
@@ -424,10 +476,6 @@ def process_studies(
     cache_dir: Path | None = None,
     skip_failures: bool = True,
 ) -> dict:
-    """
-    Pull several studies. Returns {'by_study': {name: MultiOmicsOutput}, 'failed': {}}.
-    Tables are per-study and unreconciled; feature names are not comparable across studies.
-    """
     study_names = [s.lower() for s in (study_names or ALL_STUDIES)]
     if unknown := [s for s in study_names if s not in ALL_STUDIES]:
         raise ValueError(f"Unknown studies {unknown}. Must be from: {ALL_STUDIES}")
@@ -435,20 +483,24 @@ def process_studies(
     if cache_dir:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
-    tag = "with_normal" if include_normal else "tumor_only"
 
+    tag = "with_normal" if include_normal else "tumor_only"
     by_study, failed = {}, {}
+
     for name in study_names:
         cached = cache_dir / f"{name}_{tag}.pkl" if cache_dir else None
         try:
             if cached and cached.exists():
                 by_study[name] = pd.read_pickle(cached)
                 continue
+
             print(f"[{name}] downloading", file=sys.stderr)
             by_study[name] = process_cancer(name, recurrence_column, include_normal)
+
             if cached:
                 pd.to_pickle(by_study[name], cached)
-        except Exception as exc:  # one bad study should not kill the run
+
+        except Exception as exc:
             failed[name] = f"{type(exc).__name__}: {exc}"
             print(f"[{name}] FAILED: {exc}", file=sys.stderr)
             if not skip_failures:
@@ -456,6 +508,7 @@ def process_studies(
 
     if not by_study:
         raise RuntimeError(f"No studies processed. Failures: {failed}")
+
     return {"by_study": by_study, "failed": failed}
 
 
@@ -478,16 +531,17 @@ def _save_output(
             study_dir / f"{study_name}_phosphoproteomics.csv",
             index=False,
         )
+        output["acetylproteomics"].to_csv(
+            study_dir / f"{study_name}_acetylproteomics.csv",
+            index=False,
+        )
 
     return combined_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Query one or more CPTAC cancers into proteomics + phosphoproteomics "
-            "recurrence tables."
-        )
+        description="Query one or more CPTAC cancers into multi-omics recurrence tables."
     )
     parser.add_argument(
         "-s",
@@ -511,7 +565,7 @@ def main():
     parser.add_argument(
         "--save-modalities",
         action="store_true",
-        help="Also save patient_info, proteomics-only, and phosphoproteomics-only CSVs.",
+        help="Also save patient_info and modality-specific CSVs.",
     )
     parser.add_argument(
         "--include-normal",
@@ -548,10 +602,16 @@ def main():
             study_name=studies[0],
             save_modalities=args.save_modalities,
         )
+
         print(f"Saved combined data to {combined_path}")
         print(f"Combined data shape: {output['combined'].shape}")
         print(f"Proteomics-only shape: {output['proteomics'].shape}")
         print(f"Phosphoproteomics-only shape: {output['phosphoproteomics'].shape}")
+        print(f"Acetylproteomics-only shape: {output['acetylproteomics'].shape}")
+        print(
+            "Derived recurrence time nonmissing: "
+            f"{output['combined'][DERIVED_RECURRENCE_TIME_COL].notna().sum()}"
+        )
         return
 
     result = process_studies(
@@ -561,9 +621,11 @@ def main():
         cache_dir=args.cache_dir,
         skip_failures=not args.fail_fast,
     )
+
     for name, output in result["by_study"].items():
         path = _save_output(output, args.output_dir, name, args.save_modalities)
         print(f"[{name}] {output['combined'].shape} -> {path}")
+
     if result["failed"]:
         print(f"Failed: {list(result['failed'])}")
 
