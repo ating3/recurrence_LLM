@@ -66,13 +66,13 @@ META_COLS = [
 ]
 
 
-def as_list(value) -> list:
+def _as_list(value) -> list:
     if isinstance(value, (list, tuple, set, np.ndarray, pd.Index)):
         return list(value)
     return [value]
 
 
-def make_unique(names: list[str]) -> list[str]:
+def _make_unique(names: list[str]) -> list[str]:
     seen = {}
     unique_names = []
     for name in names:
@@ -108,7 +108,7 @@ class MultiOmicsOutput:
         return getattr(self, key)
 
 
-def get_study(study_name: str):
+def _get_study(study_name: str):
     """
     Given a study name, return the CPTAC study object.
     """
@@ -120,7 +120,7 @@ def get_study(study_name: str):
     return study_class()
 
 
-def choose_source(study, data_type: str, study_name: str) -> str:
+def _choose_source(study, data_type: str, study_name: str) -> str:
     """
     Pick the requested source when known; otherwise use the only available source.
     """
@@ -133,7 +133,7 @@ def choose_source(study, data_type: str, study_name: str) -> str:
     if len(available) == 0:
         raise ValueError(f"{study_name.upper()} has no {data_type} data source listed.")
 
-    available_sources = as_list(available[0])
+    available_sources = _as_list(available[0])
     preferred = SOURCE_BY_CANCER.get((study_name, data_type), "umich")
 
     if preferred in available_sources:
@@ -147,17 +147,17 @@ def choose_source(study, data_type: str, study_name: str) -> str:
     )
 
 
-def get_clinical_data(study, study_name: str) -> pd.DataFrame:
+def _get_clinical_data(study, study_name: str) -> pd.DataFrame:
     """
     Return the clinical table for a CPTAC study.
     """
-    source = choose_source(study, "clinical", study_name)
+    source = _choose_source(study, "clinical", study_name)
     clinical = study.get_clinical(source=source)
     clinical.index = clinical.index.astype(str)
     return clinical
 
 
-def collapse_duplicate_features(df: pd.DataFrame) -> pd.DataFrame:
+def _collapse_duplicate_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Merge duplicate feature columns by taking the first non-missing value per sample.
     """
@@ -167,7 +167,7 @@ def collapse_duplicate_features(df: pd.DataFrame) -> pd.DataFrame:
     return df.T.groupby(level=list(range(df.columns.nlevels)), sort=False).first().T
 
 
-def remove_non_patient_samples(df: pd.DataFrame) -> pd.DataFrame:
+def _remove_non_patient_samples(df: pd.DataFrame) -> pd.DataFrame:
     bad_pattern = r"pool|reference|ref|control"
     keep_mask = ~df["Base_Patient_ID"].astype(str).str.lower().str.contains(
         bad_pattern,
@@ -177,7 +177,7 @@ def remove_non_patient_samples(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep_mask].copy()
 
 
-def flatten_columns(cols) -> list[str]:
+def _flatten_columns(cols) -> list[str]:
     """
     Collapse a possibly MultiIndex column axis into unique single-level strings.
 
@@ -200,7 +200,7 @@ def flatten_columns(cols) -> list[str]:
     return flat
 
 
-def find_recurrence_column(
+def _find_recurrence_column(
     clinical: pd.DataFrame,
     recurrence_column: str | None = None,
 ) -> str | None:
@@ -246,7 +246,7 @@ def find_recurrence_column(
     return None
 
 
-def normalize_recurrence_value(value):
+def _normalize_recurrence_value(value):
     """
     Convert common recurrence labels to booleans while preserving unknown labels.
     """
@@ -273,7 +273,7 @@ def normalize_recurrence_value(value):
     return value
 
 
-def build_patient_info(
+def _build_patient_info(
     sample_ids: pd.Index,
     study_name: str,
     clinical: pd.DataFrame,
@@ -302,13 +302,13 @@ def build_patient_info(
             patient_info[col] = pd.NA
 
     if recurrence_col is not None:
-        recurrence = clinical[recurrence_col].map(normalize_recurrence_value)
+        recurrence = clinical[recurrence_col].map(_normalize_recurrence_value)
         if not recurrence.index.is_unique:
             recurrence = recurrence.groupby(level=0).first()
         patient_info["Recurrence"] = patient_info["Base_Patient_ID"].map(recurrence)
     elif RECURRENCE_STATUS_COLUMN in patient_info.columns:
         patient_info["Recurrence"] = patient_info[RECURRENCE_STATUS_COLUMN].map(
-            normalize_recurrence_value
+            _normalize_recurrence_value
         )
     else:
         patient_info["Recurrence"] = pd.NA
@@ -327,11 +327,11 @@ def clean_abundance_data(
     """
     Return one modality with metadata columns first and prefixed feature columns.
     """
-    cleaned = collapse_duplicate_features(abundance.copy())
+    cleaned = _collapse_duplicate_features(abundance.copy())
     cleaned.index = cleaned.index.astype(str)
     cleaned.index.name = "Patient_ID"
 
-    patient_info = build_patient_info(
+    patient_info = _build_patient_info(
         cleaned.index,
         study_name=study_name,
         clinical=clinical,
@@ -339,20 +339,20 @@ def clean_abundance_data(
     )
 
     features = cleaned.reset_index()
-    features.columns = make_unique(flatten_columns(features.columns))
+    features.columns = _make_unique(_flatten_columns(features.columns))
     features = features.drop(columns=["Patient_ID"])
     features = features.rename(columns={col: f"{modality}::{col}" for col in features.columns})
     features.insert(0, "Patient_ID", cleaned.index.to_numpy())
 
     modality_df = patient_info.merge(features, on="Patient_ID", how="left")
-    modality_df = remove_non_patient_samples(modality_df)
+    modality_df = _remove_non_patient_samples(modality_df)
     if not include_normal:
         modality_df = modality_df[modality_df["Tumor_Present"]].copy()
     return modality_df
 
 
-def get_abundance(study, study_name: str, modality: str) -> pd.DataFrame:
-    source = choose_source(study, modality, study_name)
+def _get_abundance(study, study_name: str, modality: str) -> pd.DataFrame:
+    source = _choose_source(study, modality, study_name)
     return getattr(study, f"get_{modality}")(source=source)
 
 
@@ -393,13 +393,13 @@ def process_cancer(
     if study_name not in ALL_STUDIES:
         raise ValueError(f"Study must be one of: {ALL_STUDIES}")
 
-    study = get_study(study_name)
-    clinical = get_clinical_data(study, study_name)
-    recurrence_col = find_recurrence_column(clinical, recurrence_column)
+    study = _get_study(study_name)
+    clinical = _get_clinical_data(study, study_name)
+    recurrence_col = _find_recurrence_column(clinical, recurrence_column)
 
     modality_frames = {}
     for modality in MODALITIES:
-        abundance = get_abundance(study, study_name, modality)
+        abundance = _get_abundance(study, study_name, modality)
         modality_frames[modality] = clean_abundance_data(
             abundance=abundance,
             modality=modality,
@@ -422,7 +422,7 @@ def process_cancer(
     )
 
 
-def save_output(
+def _save_output(
     output: MultiOmicsOutput,
     output_dir: Path,
     study_name: str,
@@ -488,7 +488,7 @@ def main():
         recurrence_column=args.recurrence_column,
         include_normal=args.include_normal,
     )
-    combined_path = save_output(
+    combined_path = _save_output(
         output=output,
         output_dir=args.output_dir,
         study_name=args.study,
