@@ -9,7 +9,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-
+from pathlib import Path
 from query_patients import ALL_STUDIES, process_cancer
 
 
@@ -29,6 +29,56 @@ MODALITY_TO_TAG = {
     "acetylproteome": ACETYLPROTEOMICS_TAG,
 }
 
+def compute_linear_shap_values(model, X_train, X_test):
+    """
+    Compute exact linear SHAP-style contributions for the CoxNet risk score.
+
+    SHAP contribution:
+        beta_j * (x_j - mean_train_j)
+
+    where x_j is after the same imputer/scaler preprocessing used by the model.
+    """
+    preprocess = model[:-1]
+    coxnet = model.named_steps["coxnet"]
+
+    X_train_processed = preprocess.transform(X_train)
+    X_test_processed = preprocess.transform(X_test)
+
+    coefficients = coxnet.coef_.ravel()
+    background = X_train_processed.mean(axis=0)
+
+    shap_values = (X_test_processed - background) * coefficients
+    base_value = float(background @ coefficients)
+
+    shap_df = pd.DataFrame(
+        shap_values,
+        columns=X_train.columns,
+        index=X_test.index,
+    )
+
+    return shap_df, base_value
+
+
+def summarize_global_shap(shap_df):
+    global_shap = pd.DataFrame({
+        "feature": shap_df.columns,
+        "mean_abs_shap": shap_df.abs().mean(axis=0).values,
+        "mean_shap": shap_df.mean(axis=0).values,
+    })
+
+    return global_shap.sort_values("mean_abs_shap", ascending=False)
+
+
+def summarize_patient_shap(shap_df, patient_index, top_n=10):
+    patient_shap = shap_df.loc[patient_index]
+
+    out = pd.DataFrame({
+        "feature": patient_shap.index,
+        "shap_value": patient_shap.values,
+        "abs_shap": patient_shap.abs().values,
+    })
+
+    return out.sort_values("abs_shap", ascending=False).head(top_n)
 
 def canonical(col: str) -> str:
     if "::" not in col:
@@ -236,6 +286,23 @@ def main():
     model = grid.best_estimator_
     c_index = model.score(X_test, y_test)
 
+    shap_df, shap_base_value = compute_linear_shap_values(model, X_train, X_test)
+    global_shap = summarize_global_shap(shap_df)
+
+    shap_output_dir = Path("outputs")
+    shap_output_dir.mkdir(exist_ok=True)
+
+    study_label = "_".join(studies)
+    modality_label = "_".join(tag.replace("::", "") for tag in selected_tags)
+
+    global_shap_path = shap_output_dir / f"{study_label}_{modality_label}_global_shap.csv"
+    patient_shap_path = shap_output_dir / f"{study_label}_{modality_label}_patient_shap.csv"
+
+    global_shap.to_csv(global_shap_path, index=False)
+    shap_df.to_csv(patient_shap_path, index=True)
+
+    top_global_shap = global_shap.head(10)
+
     coefficients = model.named_steps["coxnet"].coef_.ravel()
 
     feature_importance = pd.DataFrame({
@@ -259,6 +326,10 @@ def main():
     print(f"Test concordance index: {c_index:.4f}")
     print(f"Top 10 important features:\n{important_features.to_string(index=False)}")
 
+    print(f"SHAP base risk value: {shap_base_value:.4f}")
+    print(f"Saved global SHAP summary to: {global_shap_path}")
+    print(f"Saved patient-level SHAP values to: {patient_shap_path}")
+    print(f"Top 10 global SHAP features:\n{top_global_shap.to_string(index=False)}")
 
 if __name__ == "__main__":
     main()
