@@ -3,8 +3,9 @@ from argparse import ArgumentParser
 import numpy as np
 import pandas as pd
 
-from sklearn.impute import SimpleImputer
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
@@ -13,11 +14,7 @@ from sklearn.metrics import (
     confusion_matrix,
     roc_auc_score,
 )
-from sklearn.model_selection import (
-    GridSearchCV,
-    StratifiedKFold,
-    train_test_split,
-)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -40,6 +37,64 @@ MODALITY_TO_TAG = {
     "acetylproteomics": ACETYLPROTEOMICS_TAG,
     "acetylproteome": ACETYLPROTEOMICS_TAG,
 }
+
+FEATURE_COUNT_GRID = [5, 10, 20, 30]
+C_GRID = [0.1, 1.0, 10.0]
+L1_RATIO_GRID = [0.1, 0.5, 0.9]
+
+
+class TrainingFeatureFilter(BaseEstimator, TransformerMixin):
+    """
+    Remove highly missing, empty, and constant features.
+
+    Because this transformer is inside the Pipeline, it learns which
+    columns to retain using only the training patients in the current
+    cross-validation fold.
+    """
+
+    def __init__(self, missing_threshold=0.60):
+        self.missing_threshold = missing_threshold
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError(
+                "TrainingFeatureFilter expects a pandas DataFrame."
+            )
+
+        if not 0 < self.missing_threshold <= 1:
+            raise ValueError(
+                "missing_threshold must be greater than 0 and at most 1."
+            )
+
+        missingness = X.isna().mean()
+        unique_values = X.nunique(dropna=True)
+
+        keep = (
+            (missingness < self.missing_threshold)
+            & (unique_values > 1)
+        )
+
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.selected_columns_ = np.asarray(
+            X.columns[keep],
+            dtype=object,
+        )
+
+        if len(self.selected_columns_) == 0:
+            raise ValueError(
+                "No features remain after missingness and variance filtering."
+            )
+
+        return self
+
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X, columns=self.feature_names_in_)
+
+        return X.loc[:, self.selected_columns_]
+
+    def get_feature_names_out(self, input_features=None):
+        return self.selected_columns_
 
 
 def canonical(col: str) -> str:
@@ -94,7 +149,10 @@ def parse_binary_event(series: pd.Series) -> pd.Series:
 
 
 def select_modalities(requested_modalities):
-    requested_modalities = [m.lower() for m in requested_modalities]
+    requested_modalities = [
+        modality.lower()
+        for modality in requested_modalities
+    ]
 
     if "all" in requested_modalities:
         return (
@@ -115,7 +173,10 @@ def select_modalities(requested_modalities):
             f"Valid options are {sorted(MODALITY_TO_TAG)} or all."
         )
 
-    return tuple(MODALITY_TO_TAG[m] for m in requested_modalities)
+    return tuple(
+        MODALITY_TO_TAG[modality]
+        for modality in requested_modalities
+    )
 
 
 def load_studies(studies, selected_tags):
@@ -142,17 +203,17 @@ def load_studies(studies, selected_tags):
 
 def prepare_fixed_horizon_outcome(study_df, horizon_days):
     """
-    Construct a fixed-horizon binary outcome.
+    Construct a fixed-horizon binary recurrence outcome.
 
     Positive:
         Recurrence occurred on or before the horizon.
 
     Negative:
-        No recurrence was observed through the horizon, or recurrence
-        occurred after the horizon.
+        The patient remained recurrence-free through the horizon,
+        including patients whose recurrence occurred after the horizon.
 
     Excluded:
-        No recurrence, but follow-up ended before the horizon.
+        No recurrence was recorded, but follow-up ended before the horizon.
     """
     event = parse_binary_event(study_df[EVENT_COL])
     time = pd.to_numeric(study_df[TIME_COL], errors="coerce")
@@ -169,14 +230,25 @@ def prepare_fixed_horizon_outcome(study_df, horizon_days):
     event = event.loc[known_outcome]
     time = time.loc[known_outcome]
 
-    # A late recurrence is negative for recurrence by this horizon.
     target = (event & (time <= horizon_days)).astype(int)
+
+    model_df = model_df.reset_index(drop=True)
+    target = target.reset_index(drop=True)
 
     return model_df, target
 
 
-def make_model(C=1.0, l1_ratio=0.5, number_features=20):
+def make_model(missing_threshold):
+    """
+    Complete fold-specific preprocessing and classification pipeline.
+    """
     return Pipeline([
+        (
+            "feature_filter",
+            TrainingFeatureFilter(
+                missing_threshold=missing_threshold,
+            ),
+        ),
         (
             "imputer",
             SimpleImputer(strategy="median"),
@@ -185,7 +257,7 @@ def make_model(C=1.0, l1_ratio=0.5, number_features=20):
             "selector",
             SelectKBest(
                 score_func=f_classif,
-                k=number_features,
+                k=20,
             ),
         ),
         (
@@ -197,8 +269,6 @@ def make_model(C=1.0, l1_ratio=0.5, number_features=20):
             LogisticRegression(
                 penalty="elasticnet",
                 solver="saga",
-                C=C,
-                l1_ratio=l1_ratio,
                 class_weight=None,
                 max_iter=20000,
                 tol=1e-3,
@@ -206,6 +276,69 @@ def make_model(C=1.0, l1_ratio=0.5, number_features=20):
             ),
         ),
     ])
+
+
+def make_parameter_grid(number_of_input_features):
+    feature_counts = [
+        count
+        for count in FEATURE_COUNT_GRID
+        if count <= number_of_input_features
+    ]
+
+    if not feature_counts:
+        feature_counts = [number_of_input_features]
+
+    return {
+        "selector__k": feature_counts,
+        "classifier__C": C_GRID,
+        "classifier__l1_ratio": L1_RATIO_GRID,
+    }
+
+
+def make_stratified_cv(requested_folds, target, random_state):
+    smallest_class = int(target.value_counts().min())
+    number_of_folds = min(requested_folds, smallest_class)
+
+    if number_of_folds < 2:
+        raise ValueError(
+            "At least two patients from each class are required "
+            "for stratified cross-validation."
+        )
+
+    return StratifiedKFold(
+        n_splits=number_of_folds,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+
+def extract_feature_importance(fitted_model):
+    """
+    Match the final coefficients to the features retained by both
+    filtering and SelectKBest.
+    """
+    filtered_features = fitted_model.named_steps[
+        "feature_filter"
+    ].get_feature_names_out()
+
+    selector = fitted_model.named_steps["selector"]
+    selected_features = filtered_features[selector.get_support()]
+
+    coefficients = fitted_model.named_steps[
+        "classifier"
+    ].coef_[0]
+
+    importance = pd.DataFrame({
+        "feature": selected_features,
+        "coefficient": coefficients,
+        "odds_ratio": np.exp(np.clip(coefficients, -20, 20)),
+        "absolute_coefficient": np.abs(coefficients),
+    })
+
+    return importance.sort_values(
+        "absolute_coefficient",
+        ascending=False,
+    )
 
 
 def main():
@@ -239,63 +372,56 @@ def main():
         "--missing-threshold",
         type=float,
         default=0.60,
-        help="Drop features missing in this fraction of training samples.",
-    )
-
-    parser.add_argument(
-        "--test-size",
-        type=float,
-        default=0.20,
-    )
-
-    parser.add_argument(
-        "--C",
-        type=float,
-        default=0.1,
-        help="Inverse regularization strength.",
-    )
-
-    parser.add_argument(
-        "--l1-ratio",
-        type=float,
-        default=0.5,
-        help="0 is ridge-like, 1 is lasso-like.",
-    )
-
-    parser.add_argument(
-        "--number-features",
-        type=int,
-        default=20,
         help=(
-            "Number of features selected before logistic regression "
-            "when --tune is not used."
+            "Within each training fold, drop features missing in "
+            "this fraction of patients."
         ),
     )
 
     parser.add_argument(
-        "--tune",
-        action="store_true",
-        help="Tune C and l1_ratio using training-set cross-validation.",
+        "--outer-folds",
+        type=int,
+        default=5,
+        help="Outer stratified folds used to evaluate performance.",
+    )
+
+    parser.add_argument(
+        "--inner-folds",
+        type=int,
+        default=3,
+        help="Inner stratified folds used for GridSearchCV.",
     )
 
     parser.add_argument(
         "--n-jobs",
         type=int,
         default=1,
-        help="Parallel jobs for GridSearchCV.",
+        help="Parallel jobs used by GridSearchCV.",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        type=int,
+        default=0,
+        help="GridSearchCV verbosity.",
     )
 
     args = parser.parse_args()
 
-    requested_studies = [study.lower() for study in args.study]
+    requested_studies = [
+        study.lower()
+        for study in args.study
+    ]
 
     if "all" in requested_studies:
-        studies = [study.lower() for study in ALL_STUDIES]
+        studies = [
+            study.lower()
+            for study in ALL_STUDIES
+        ]
     else:
         studies = requested_studies
 
     selected_tags = select_modalities(args.modality)
-
     study_df = load_studies(studies, selected_tags)
 
     features = [
@@ -319,228 +445,276 @@ def main():
             "The selected data do not contain both recurrence classes."
         )
 
+    X = (
+        model_df[features]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+    )
+
+    cancer_types = (
+        model_df[CANCER_COL]
+        .astype(str)
+        .reset_index(drop=True)
+    )
+
     print("\nOutcome information:")
     print(f"Prediction horizon: {args.horizon_days:.0f} days")
     print(f"Usable patients: {len(model_df)}")
-    print(target.value_counts().rename({0: "No recurrence", 1: "Recurrence"}))
+    print(
+        target.value_counts()
+        .rename({0: "No recurrence", 1: "Recurrence"})
+    )
 
     print("\nPatients by cancer:")
-    print(model_df[CANCER_COL].value_counts())
+    print(cancer_types.value_counts())
 
-    X = model_df[features].apply(pd.to_numeric, errors="coerce")
-    X = X.replace([np.inf, -np.inf], np.nan)
+    print(f"\nInput features before fold-specific filtering: {X.shape[1]}")
 
-    cancer_types = model_df[CANCER_COL].astype(str)
-
-    # Keep cancer and recurrence proportions similar in train and test.
-    cancer_event_strata = cancer_types + "_" + target.astype(str)
-
-    if cancer_event_strata.value_counts().min() >= 2:
-        stratify = cancer_event_strata
-    else:
-        stratify = target
-
-    (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        cancer_train,
-        cancer_test,
-    ) = train_test_split(
-        X,
-        target,
-        cancer_types,
-        test_size=args.test_size,
+    outer_cv = make_stratified_cv(
+        requested_folds=args.outer_folds,
+        target=target,
         random_state=42,
-        stratify=stratify,
     )
 
-    # Feature filtering is based only on the training set.
-    training_missingness = X_train.isna().mean()
-    training_unique_values = X_train.nunique(dropna=True)
-
-    keep_features = (
-        (training_missingness < args.missing_threshold)
-        & (training_unique_values > 1)
+    outer_strata = (
+        cancer_types
+        + "_"
+        + target.astype(str)
     )
 
-    X_train = X_train.loc[:, keep_features]
-    X_test = X_test.loc[:, X_train.columns]
+    if outer_strata.value_counts().min() < outer_cv.n_splits:
+        outer_strata = target
 
-    if X_train.shape[1] == 0:
-        raise ValueError(
-            "No features remain after training-set feature filtering."
+    parameter_grid = make_parameter_grid(X.shape[1])
+
+    outer_results = []
+    out_of_fold_probability = np.full(len(target), np.nan)
+    out_of_fold_prediction = np.full(len(target), -1, dtype=int)
+
+    for fold, (train_index, test_index) in enumerate(
+        outer_cv.split(X, outer_strata),
+        start=1,
+    ):
+        print(
+            f"\nOuter fold {fold}/{outer_cv.n_splits}: "
+            f"train={len(train_index)}, test={len(test_index)}"
         )
 
-    print(f"\nTraining patients: {X_train.shape[0]}")
-    print(f"Testing patients: {X_test.shape[0]}")
-    print(f"Features after filtering: {X_train.shape[1]}")
+        X_outer_train = X.iloc[train_index]
+        X_outer_test = X.iloc[test_index]
+        y_outer_train = target.iloc[train_index]
+        y_outer_test = target.iloc[test_index]
 
-    if args.number_features < 1:
-        raise ValueError("--number-features must be at least 1.")
-
-    number_features = min(args.number_features, X_train.shape[1])
-
-    model = make_model(
-        C=args.C,
-        l1_ratio=args.l1_ratio,
-        number_features=number_features,
-    )
-
-    if args.tune:
-        smallest_class = int(y_train.value_counts().min())
-        cv_folds = min(3, smallest_class)
-
-        if cv_folds < 2:
-            raise ValueError(
-                "Not enough patients in both classes for cross-validation."
-            )
-
-        cross_validation = StratifiedKFold(
-            n_splits=cv_folds,
-            shuffle=True,
-            random_state=42,
+        inner_cv = make_stratified_cv(
+            requested_folds=args.inner_folds,
+            target=y_outer_train,
+            random_state=100 + fold,
         )
-
-        feature_counts = [
-            count
-            for count in [5, 10, 20, 30]
-            if count <= X_train.shape[1]
-        ]
-
-        if not feature_counts:
-            feature_counts = [X_train.shape[1]]
-
-        parameter_grid = {
-            "selector__k": feature_counts,
-            "classifier__C": [0.1, 1.0, 10.0],
-            "classifier__l1_ratio": [0.1, 0.5, 0.9],
-        }
 
         search = GridSearchCV(
-            estimator=model,
+            estimator=make_model(args.missing_threshold),
             param_grid=parameter_grid,
             scoring="roc_auc",
-            cv=cross_validation,
+            cv=inner_cv,
             n_jobs=args.n_jobs,
             refit=True,
-            verbose=1,
+            verbose=args.verbose,
+            error_score="raise",
         )
 
-        search.fit(X_train, y_train)
+        search.fit(X_outer_train, y_outer_train)
 
-        fitted_model = search.best_estimator_
+        best_model = search.best_estimator_
+        probability = best_model.predict_proba(
+            X_outer_test
+        )[:, 1]
+        prediction = (probability >= 0.5).astype(int)
 
-        print("\nBest parameters:")
-        print(search.best_params_)
-        print(f"Mean validation ROC-AUC: {search.best_score_:.4f}")
+        out_of_fold_probability[test_index] = probability
+        out_of_fold_prediction[test_index] = prediction
 
-        tuning_results = pd.DataFrame(search.cv_results_)
-        tuning_columns = [
-            "param_selector__k",
-            "param_classifier__C",
-            "param_classifier__l1_ratio",
-            "mean_test_score",
-            "std_test_score",
-            "rank_test_score",
-        ]
+        fold_auc = roc_auc_score(
+            y_outer_test,
+            probability,
+        )
+        fold_average_precision = average_precision_score(
+            y_outer_test,
+            probability,
+        )
+        fold_balanced_accuracy = balanced_accuracy_score(
+            y_outer_test,
+            prediction,
+        )
 
-        print("\nTop cross-validation configurations:")
+        outer_results.append({
+            "fold": fold,
+            "train_samples": len(train_index),
+            "test_samples": len(test_index),
+            "roc_auc": fold_auc,
+            "average_precision": fold_average_precision,
+            "balanced_accuracy": fold_balanced_accuracy,
+            "best_k": search.best_params_["selector__k"],
+            "best_C": search.best_params_["classifier__C"],
+            "best_l1_ratio": search.best_params_[
+                "classifier__l1_ratio"
+            ],
+        })
+
+        print(f"Best parameters: {search.best_params_}")
+        print(f"Outer-fold ROC-AUC: {fold_auc:.4f}")
         print(
-            tuning_results[tuning_columns]
-            .sort_values(
-                ["rank_test_score", "std_test_score"],
-                ascending=[True, True],
-            )
-            .head(15)
-            .to_string(index=False)
+            "Outer-fold average precision: "
+            f"{fold_average_precision:.4f}"
         )
 
-    else:
-        fitted_model = model.fit(X_train, y_train)
+    results_df = pd.DataFrame(outer_results)
 
-    recurrence_probability = fitted_model.predict_proba(X_test)[:, 1]
-    predictions = (recurrence_probability >= 0.5).astype(int)
+    print("\nNested cross-validation fold results:")
+    print(results_df.to_string(index=False))
 
-    roc_auc = roc_auc_score(y_test, recurrence_probability)
-    average_precision = average_precision_score(
-        y_test,
-        recurrence_probability,
+    print("\nNested cross-validation summary:")
+    print(
+        "Mean outer ROC-AUC: "
+        f"{results_df['roc_auc'].mean():.4f} "
+        f"+/- {results_df['roc_auc'].std(ddof=1):.4f}"
     )
-    balanced_accuracy = balanced_accuracy_score(y_test, predictions)
+    print(
+        "Mean outer average precision: "
+        f"{results_df['average_precision'].mean():.4f} "
+        f"+/- {results_df['average_precision'].std(ddof=1):.4f}"
+    )
+    print(
+        "Mean outer balanced accuracy: "
+        f"{results_df['balanced_accuracy'].mean():.4f} "
+        f"+/- {results_df['balanced_accuracy'].std(ddof=1):.4f}"
+    )
 
-    print("\nOverall test results:")
-    print(f"ROC-AUC: {roc_auc:.4f}")
-    print(f"Average precision: {average_precision:.4f}")
-    print(f"Balanced accuracy: {balanced_accuracy:.4f}")
+    pooled_auc = roc_auc_score(
+        target,
+        out_of_fold_probability,
+    )
+    pooled_average_precision = average_precision_score(
+        target,
+        out_of_fold_probability,
+    )
+    pooled_balanced_accuracy = balanced_accuracy_score(
+        target,
+        out_of_fold_prediction,
+    )
 
-    print("\nConfusion matrix:")
-    print(confusion_matrix(y_test, predictions))
+    print("\nPooled out-of-fold results:")
+    print(f"ROC-AUC: {pooled_auc:.4f}")
+    print(
+        "Average precision: "
+        f"{pooled_average_precision:.4f}"
+    )
+    print(
+        "Balanced accuracy: "
+        f"{pooled_balanced_accuracy:.4f}"
+    )
 
-    print("\nClassification report:")
+    print("\nPooled out-of-fold confusion matrix:")
+    print(confusion_matrix(target, out_of_fold_prediction))
+
+    print("\nPooled out-of-fold classification report:")
     print(
         classification_report(
-            y_test,
-            predictions,
+            target,
+            out_of_fold_prediction,
             digits=4,
             zero_division=0,
         )
     )
 
-    # Evaluate each cancer separately in the pan-cancer test set.
-    if cancer_test.nunique() > 1:
-        print("\nCancer-specific test ROC-AUC:")
+    if cancer_types.nunique() > 1:
+        print("\nCancer-specific pooled out-of-fold ROC-AUC:")
 
-        for cancer in sorted(cancer_test.unique()):
-            cancer_mask = cancer_test == cancer
-            cancer_y = y_test.loc[cancer_mask]
-            cancer_probability = recurrence_probability[cancer_mask.values]
+        for cancer in sorted(cancer_types.unique()):
+            cancer_mask = cancer_types == cancer
+            cancer_target = target.loc[cancer_mask]
 
-            if len(cancer_y) < 4 or cancer_y.nunique() < 2:
+            if (
+                len(cancer_target) < 4
+                or cancer_target.nunique() < 2
+            ):
                 print(
-                    f"{cancer.upper()}: insufficient test events "
-                    f"(n={len(cancer_y)})"
+                    f"{cancer.upper()}: insufficient outcomes "
+                    f"(n={len(cancer_target)})"
                 )
                 continue
 
             cancer_auc = roc_auc_score(
-                cancer_y,
-                cancer_probability,
+                cancer_target,
+                out_of_fold_probability[cancer_mask.to_numpy()],
             )
 
             print(
-                f"{cancer.upper()}: ROC-AUC={cancer_auc:.4f}, "
-                f"n={len(cancer_y)}"
+                f"{cancer.upper()}: "
+                f"ROC-AUC={cancer_auc:.4f}, "
+                f"n={len(cancer_target)}"
             )
 
-    selector = fitted_model.named_steps["selector"]
-    selected_features = X_train.columns[selector.get_support()]
-    coefficients = fitted_model.named_steps["classifier"].coef_[0]
+    print(
+        "\nFitting one final model on all patients for "
+        "feature interpretation..."
+    )
 
-    importance = pd.DataFrame({
-        "feature": selected_features,
-        "coefficient": coefficients,
-        "absolute_coefficient": np.abs(coefficients),
-    })
+    final_inner_cv = make_stratified_cv(
+        requested_folds=args.inner_folds,
+        target=target,
+        random_state=999,
+    )
 
-    importance = importance[
+    final_search = GridSearchCV(
+        estimator=make_model(args.missing_threshold),
+        param_grid=parameter_grid,
+        scoring="roc_auc",
+        cv=final_inner_cv,
+        n_jobs=args.n_jobs,
+        refit=True,
+        verbose=args.verbose,
+        error_score="raise",
+    )
+
+    final_search.fit(X, target)
+    final_model = final_search.best_estimator_
+
+    print("\nFinal full-data model parameters:")
+    print(final_search.best_params_)
+    print(
+        "Final inner validation ROC-AUC "
+        "(tuning only, not final performance): "
+        f"{final_search.best_score_:.4f}"
+    )
+
+    importance = extract_feature_importance(final_model)
+    nonzero_importance = importance[
         importance["coefficient"] != 0
-    ].sort_values(
-        "absolute_coefficient",
-        ascending=False,
+    ]
+
+    print(
+        "\nFinal selected features: "
+        f"{len(importance)}"
+    )
+    print(
+        "Final nonzero-coefficient features: "
+        f"{len(nonzero_importance)}"
     )
 
     print("\nTop recurrence-associated features:")
     print(
-        importance[importance["coefficient"] > 0]
+        nonzero_importance[
+            nonzero_importance["coefficient"] > 0
+        ]
         .head(10)
         .to_string(index=False)
     )
 
     print("\nTop non-recurrence-associated features:")
     print(
-        importance[importance["coefficient"] < 0]
+        nonzero_importance[
+            nonzero_importance["coefficient"] < 0
+        ]
         .head(10)
         .to_string(index=False)
     )
