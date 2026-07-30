@@ -1,3 +1,5 @@
+"""legacy feature checker, see what columns each cancer type has"""
+
 import re
 import pandas as pd
 import cptac
