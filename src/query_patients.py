@@ -3,9 +3,9 @@ Build CPTAC multi-omics recurrence tables. Queries only; harmonization and
 filtering belong to whatever consumes these tables.
 
 Examples:
-    python preprocessing_patients.py --study ucec -o processed/
-    python preprocessing_patients.py --study all -o processed/ --cache-dir .cache/
-    python preprocessing_patients.py --study brca -o processed/ --save-modalities
+    python query_patients.py --study ucec -o processed/
+    python query_patients.py --study all -o processed/ --cache-dir .cache/
+    python query_patients.py --study brca -o processed/ --save-modalities
 
 Inside Python:
     combined = process_cancer("ucec")["combined"]
@@ -31,6 +31,8 @@ MODALITIES = ("proteomics", "phosphoproteomics", "acetylproteomics")
 
 RECURRENCE_STATUS_COLUMN = "Recurrence status (1, yes; 0, no)"
 DERIVED_RECURRENCE_TIME_COL = "Derived recurrence-free survival time, days"
+RECURRENCE_FREE_SURVIVAL_TIME_COL = "Recurrence-free survival time, days"
+RECURRENCE_FREE_SURVIVAL_SOURCE_COL = "Recurrence-free survival from collection, days"
 
 RECURRENCE_TIME_COLS = [
     "Recurrence-free survival from collection, days",
@@ -47,7 +49,7 @@ CENSOR_TIME_COLS = [
 RECURRENCE_CLINICAL_COLS = [
     "diagnostic_evidence_of_recurrence_or_relapse",
     "Recurrence-free survival, days",
-    "Recurrence-free survival from collection, days",
+    RECURRENCE_FREE_SURVIVAL_SOURCE_COL,
     RECURRENCE_STATUS_COLUMN,
     "number_of_days_from_date_of_collection_to_date_of_last_contact",
     "Overall survival from collection, days",
@@ -79,6 +81,7 @@ META_COLS = [
     "Tumor_Present",
     *RECURRENCE_CLINICAL_COLS,
     "Recurrence",
+    RECURRENCE_FREE_SURVIVAL_TIME_COL,
     DERIVED_RECURRENCE_TIME_COL,
 ]
 
@@ -303,6 +306,9 @@ def _add_derived_recurrence_time(patient_info: pd.DataFrame) -> pd.DataFrame:
     derived_time.loc[event == True] = recurrence_time.loc[event == True]
     derived_time.loc[event == False] = censor_time.loc[event == False]
 
+    # This is the only multi-source constructed time column. The standardized
+    # raw recurrence-time column is copied from one CPTAC source column in
+    # _build_patient_info and must not be overwritten here.
     patient_info[DERIVED_RECURRENCE_TIME_COL] = derived_time
     return patient_info
 
@@ -343,6 +349,13 @@ def _build_patient_info(
         )
     else:
         patient_info["Recurrence"] = pd.NA
+
+    # Standardized name used by the PU classifier. This is a direct copy of
+    # one CPTAC field, not a fallback across several recurrence/censor columns.
+    patient_info[RECURRENCE_FREE_SURVIVAL_TIME_COL] = pd.to_numeric(
+        patient_info[RECURRENCE_FREE_SURVIVAL_SOURCE_COL],
+        errors="coerce",
+    )
 
     patient_info = _add_derived_recurrence_time(patient_info)
     return patient_info[META_COLS]
